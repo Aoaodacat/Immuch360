@@ -131,6 +131,16 @@ private class DualFisheyeShaderProgram(
 ) : BaseGlShaderProgram(/* useHighPrecisionColorComponents= */ useHdr, /* texturePoolCapacity= */ 1) {
   private val glProgram = GlProgram(RawStitchShaders.vertexEs1(), RawStitchShaders.fragmentEs1SideBySide())
 
+  /**
+   * 用文件里的陀螺仪做防抖。为 null（没有 IMU 记录）时画面照原样呈现。
+   *
+   * 校正量在 [drawFrame] 里按帧时间戳算一次，然后右乘到两个镜头的 uViewToLens 上：
+   * 着色器里 d = viewToLens * v，所以 viewToLens * corr 等价于「先把视线方向稳住，再投到镜头」。
+   */
+  private val stabilizer = projection.gyro?.let { GyroStabilizer(it) }?.takeIf { it.isValid }
+  private val corrMatrix = FloatArray(9)
+  private val stabMat = FloatArray(9)
+
   init {
     // The quad covers the whole output, from -1 to 1 in normalized device coordinates
     glProgram.setBufferAttribute(
@@ -159,12 +169,41 @@ private class DualFisheyeShaderProgram(
   override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
     try {
       glProgram.use()
+      applyStabilization(presentationTimeUs)
       glProgram.setSamplerTexIdUniform(RawStitchShaders.SIDE_BY_SIDE_SAMPLER, inputTexId, /* texUnitIndex= */ 0)
       glProgram.bindAttributesAndUniforms()
       // The four vertex triangle strip forms the quad
       GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, /* first= */ 0, /* count= */ 4)
     } catch (e: GlUtil.GlException) {
       throw VideoFrameProcessingException(e, presentationTimeUs)
+    }
+  }
+
+  /** 按这一帧的时间戳重设两个镜头的 viewToLens；超出 IMU 覆盖范围时不动，画面回到未校正状态 */
+  private fun applyStabilization(presentationTimeUs: Long) {
+    val stab = stabilizer ?: return
+    if (!stab.correctionMatrixAt(presentationTimeUs / 1000f, corrMatrix)) return
+    projection.lenses.forEachIndexed { index, lens ->
+      // 列主序 × 列主序：结果 = viewToLens * corr
+      val base = RawStitchUniforms.columnMajor(lens.viewToLens)
+      mulColumnMajor(base, corrMatrix, stabMat)
+      glProgram.setFloatsUniformIfPresent("uViewToLens$index", stabMat)
+    }
+  }
+
+  /**
+   * 3×3 矩阵乘 `out = a * b`，三者都是列主序（GLSL 读 mat3 的约定）。
+   *
+   * 列主序下 `m[col * 3 + row]` 才是 m[row][col]，所以 `out[r][c] = Σ a[r][k] * b[k][c]` 写成
+   * `a[k * 3 + r] * b[c * 3 + k]`。
+   */
+  private fun mulColumnMajor(a: FloatArray, b: FloatArray, out: FloatArray) {
+    for (c in 0 until 3) {
+      for (r in 0 until 3) {
+        var sum = 0f
+        for (k in 0 until 3) sum += a[k * 3 + r] * b[c * 3 + k]
+        out[c * 3 + r] = sum
+      }
     }
   }
 
