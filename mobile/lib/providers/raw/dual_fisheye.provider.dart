@@ -22,6 +22,7 @@ import 'package:immich_mobile/domain/services/raw/dji_osv.dart';
 import 'package:immich_mobile/domain/services/raw/dual_fisheye_calibration_store.dart';
 import 'package:immich_mobile/domain/services/raw/dual_fisheye_math.dart';
 import 'package:immich_mobile/domain/services/raw/insta360_trailer.dart';
+import 'package:immich_mobile/domain/services/raw/raw_gyro_cache.dart';
 import 'package:immich_mobile/domain/services/raw/raw_video_plan.dart';
 import 'package:immich_mobile/domain/services/spherical_probe.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
@@ -41,7 +42,12 @@ const _nominalSquare = 2880;
 
 /// A calibration, and whether reading the file failed on the way to it (a network error, a timeout): such a result is
 /// not kept, the next opening tries again
-typedef ResolvedDualFisheyeCalibration = ({DualFisheyeCalibration calibration, bool readFailed});
+typedef ResolvedDualFisheyeCalibration = ({
+  DualFisheyeCalibration calibration,
+  bool readFailed,
+  /// 陀螺仪样本 `[t,gx,gy,gz,...]`（t 相对首样本毫秒，角速度 rad/s），供防抖用
+  List<double>? gyroSamples,
+});
 
 /// The calibration of a raw dual fisheye file of [fileSize] bytes that [read] reads (null for a file that cannot be
 /// read; [fileSize] null leaves the trailer unread, for a server that ignores range requests, of which the head of a
@@ -109,7 +115,7 @@ Future<ResolvedDualFisheyeCalibration> resolveDualFisheyeCalibration({
       // Kept for the files of the camera, and of its model, without one; the viewer does not wait for the write
       unawaited(store.remember(serial, fromFile));
     }
-    return (calibration: fromFile, readFailed: false);
+    return (calibration: fromFile, readFailed: false, gyroSamples: trailer?.gyroSamples);
   }
 
   final downBody = downBodyFromAccelerometer(trailer?.meanAccelerometer ?? accelerometer);
@@ -118,7 +124,11 @@ Future<ResolvedDualFisheyeCalibration> resolveDualFisheyeCalibration({
       (serial == null ? null : await store.forSerial(serial, downBody: downBody)) ??
       (cameraModel == null ? null : await store.forModel(cameraModel, downBody: downBody));
   if (cached != null) {
-    return (calibration: cached.copyWith(gravity: gravity, layoutHints: hints), readFailed: readFailed);
+    return (
+      calibration: cached.copyWith(gravity: gravity, layoutHints: hints),
+      readFailed: readFailed,
+      gyroSamples: trailer?.gyroSamples,
+    );
   }
   final square = frameSquare != null && frameSquare > 0 ? frameSquare : _nominalSquare;
   return (
@@ -126,6 +136,7 @@ Future<ResolvedDualFisheyeCalibration> resolveDualFisheyeCalibration({
       square,
     ).copyWith(downBody: downBody, serial: serial, cameraModel: cameraModel, gravity: gravity, layoutHints: hints),
     readFailed: readFailed,
+    gyroSamples: trailer?.gyroSamples,
   );
 }
 
@@ -377,9 +388,14 @@ class DualFisheyeCalibrationService implements RawVideoCalibrations {
         store: store,
         frameSquare: frameSquare,
       );
-      resolved = (calibration: resolved.calibration, readFailed: true);
+      resolved = (calibration: resolved.calibration, readFailed: true, gyroSamples: resolved.gyroSamples);
     }
     final calibration = resolved.calibration;
+    final gyro = resolved.gyroSamples;
+    if (gyro != null && gyro.length >= 8) {
+      rawGyroSamples[key] = gyro;
+      _log.fine('$key: kept ${gyro.length ~/ 4} gyroscope samples for stabilization');
+    }
     _log.fine('$key: ${calibration.source.name} calibration of ${calibration.cameraModel ?? 'an unknown camera'}');
     if (!resolved.readFailed) {
       _keep(key, calibration);
