@@ -18,6 +18,7 @@ import 'package:immich_mobile/domain/models/raw/dual_fisheye_calibration.dart';
 import 'package:immich_mobile/domain/services/raw/dual_fisheye_math.dart';
 import 'package:immich_mobile/domain/services/raw/gopro_eac.dart';
 import 'package:immich_mobile/domain/services/raw/insta360_trailer.dart';
+import 'package:immich_mobile/domain/services/raw/raw_gyro_cache.dart';
 import 'package:immich_mobile/domain/services/raw/raw_360_detection.dart';
 import 'package:immich_mobile/domain/services/raw/raw_sampler.dart';
 import 'package:immich_mobile/domain/services/spherical_probe.dart';
@@ -193,6 +194,7 @@ class RawVideoPlan {
     this.secondUrl,
     this.secondFallbackUrl,
     required this.trackOrderSource,
+    this.gyroSamples,
   });
 
   final RawMediaKind kind;
@@ -208,6 +210,10 @@ class RawVideoPlan {
 
   /// For a fisheye pair: the index in [tracks] of the texture that holds lens i
   final List<int>? textureOfLens;
+
+  /// 陀螺仪样本 `[t, gx, gy, gz, ...]`（t 相对首样本毫秒，角速度 rad/s），null 表示没有 IMU 数据。
+  /// 原生渲染层用它按帧时间戳算出防抖校正量。
+  final List<double>? gyroSamples;
 
   /// For a GoPro: the layout of its two EAC tracks
   final GoProEacGeometry? eac;
@@ -294,6 +300,7 @@ class RawVideoPlan {
       'maxTheta': calibration.maxTheta,
       'blendStart': calibration.blendStart,
       'blendEnd': calibration.blendEnd,
+      if (_gyroForJson() case final gyro?) 'gyro': gyro,
       'lenses': [
         for (final (i, lens) in calibration.lenses.indexed)
           {
@@ -321,6 +328,24 @@ class RawVideoPlan {
           },
       ],
     };
+  }
+
+  /// 给原生的陀螺仪样本：去掉 3/4 的样本（200Hz → 50Hz，防抖够用），数值压到 3 位小数，
+  /// 免得几万条样本把 JSON 撑到几 MB。
+  List<double>? _gyroForJson() {
+    final g = gyroSamples;
+    if (g == null || g.length < 16) return null;
+    double r3(double v) => (v * 1000).roundToDouble() / 1000;
+    final out = <double>[];
+    // 每 4 条样本取 1 条，一条样本占 4 个 double
+    for (var i = 0; i + 3 < g.length; i += 16) {
+      out
+        ..add((g[i] * 10).roundToDouble() / 10)
+        ..add(r3(g[i + 1]))
+        ..add(r3(g[i + 2]))
+        ..add(r3(g[i + 3]));
+    }
+    return out.length < 16 ? null : out;
   }
 
   Map<String, Object?> _eacJson(GoProEacGeometry eac) => {
@@ -710,6 +735,7 @@ class RawVideoResolver {
         // The server transcodes the first video track only: one lens, which would be drawn as both
         url: input.originalUrl ?? input.url,
         trackOrderSource: source,
+        gyroSamples: rawGyroSamples[input.key],
       );
     }
 
@@ -740,6 +766,7 @@ class RawVideoResolver {
         url: input.url,
         fallbackUrl: input.fallbackUrl,
         trackOrderSource: 'single',
+        gyroSamples: rawGyroSamples[input.key],
       );
     }
 
