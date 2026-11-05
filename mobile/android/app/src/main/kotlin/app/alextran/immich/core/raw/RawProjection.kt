@@ -139,6 +139,12 @@ class RawProjection(
   val blendEndDegrees: Double,
   val lenses: List<RawLens>,
   val eac: EacGeometry?,
+  /**
+   * Gyroscope samples for stabilization, flattened as `[t, gx, gy, gz, ...]`: [t] in milliseconds from the first
+   * sample (the same origin as the presentation time of the frames), the rates in radians per second in the frame of
+   * the IMU. Null when the file has no IMU record.
+   */
+  val gyro: FloatArray? = null,
 ) {
   /** The lenses come in two decoded streams (two tracks or two files): the compositor's job, not the effect's. */
   val isLensLayout: Boolean
@@ -447,7 +453,24 @@ class RawProjection(
         blendEndDegrees = blendEnd,
         lenses = lenses,
         eac = null,
+        gyro = gyroOf(root),
       )
+    }
+
+    /**
+     * The gyroscope samples the Dart side puts in the JSON: `[t, gx, gy, gz, ...]`, 4 numbers a sample.
+     * A malformed array is dropped (the frame shows unsteadied) rather than failing the whole projection.
+     */
+    private fun gyroOf(root: JsonObject): FloatArray? {
+      val array = root["gyro"] as? JsonArray ?: return null
+      if (array.size < 16 || array.size % 4 != 0) return null
+      val out = FloatArray(array.size)
+      for (i in array.indices) {
+        val value = (array[i] as? JsonPrimitive)?.doubleOrNull ?: return null
+        if (!value.isFinite()) return null
+        out[i] = value.toFloat()
+      }
+      return out
     }
 
     private fun lensOf(json: JsonObject, model: LensModel, textures: Int): RawLens {
