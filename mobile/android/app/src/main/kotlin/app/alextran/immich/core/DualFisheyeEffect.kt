@@ -1,6 +1,7 @@
 package app.alextran.immich.core
 
 import android.content.Context
+import java.util.concurrent.atomic.AtomicBoolean
 import android.graphics.Matrix
 import android.opengl.GLES20
 import android.util.Log
@@ -142,6 +143,18 @@ private class DualFisheyeShaderProgram(
   private val corrMatrix = FloatArray(9)
   private val stabMat = FloatArray(9)
 
+  /**
+   * 两个镜头的 viewToLens 已换成列主序，构造时算一次 —— 它们不随帧变化，
+   * 每帧重算既浪费又制造 GC 压力（60fps 下每秒 120 个短命数组）。
+   */
+  private val baseMatrices = projection.lenses.map { RawStitchUniforms.columnMajor(it.viewToLens) }
+
+  /**
+   * [release] 之后 GL program 已删除，但 Media3 的渲染队列里可能还有一帧在等。
+   * 对已删除的 program 操作在部分驱动上会直接崩，所以先挡掉。
+   */
+  private val released = AtomicBoolean(false)
+
   init {
     // The quad covers the whole output, from -1 to 1 in normalized device coordinates
     glProgram.setBufferAttribute(
@@ -168,6 +181,7 @@ private class DualFisheyeShaderProgram(
   }
 
   override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
+    if (released.get()) return
     try {
       glProgram.use()
       applyStabilization(presentationTimeUs)
@@ -184,10 +198,9 @@ private class DualFisheyeShaderProgram(
   private fun applyStabilization(presentationTimeUs: Long) {
     val stab = stabilizer ?: return
     if (!stab.correctionMatrixAt(presentationTimeUs / 1000f, corrMatrix)) return
-    projection.lenses.forEachIndexed { index, lens ->
+    for (index in baseMatrices.indices) {
       // 列主序 × 列主序：结果 = viewToLens * corr
-      val base = RawStitchUniforms.columnMajor(lens.viewToLens)
-      mulColumnMajor(base, corrMatrix, stabMat)
+      mulColumnMajor(baseMatrices[index], corrMatrix, stabMat)
       glProgram.setFloatsUniformIfPresent("uViewToLens$index", stabMat)
     }
   }
@@ -209,6 +222,7 @@ private class DualFisheyeShaderProgram(
   }
 
   override fun release() {
+    released.set(true)
     super.release()
     try {
       glProgram.delete()
