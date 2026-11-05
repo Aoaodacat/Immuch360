@@ -18,6 +18,7 @@ import androidx.media3.effect.GlShaderProgram
 import androidx.media3.effect.MatrixTransformation
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.Renderer
+import app.alextran.immich.core.raw.GyroStabilizer
 import app.alextran.immich.core.raw.RawKind
 import app.alextran.immich.core.raw.RawLayout
 import app.alextran.immich.core.raw.RawProjection
