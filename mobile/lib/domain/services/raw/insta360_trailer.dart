@@ -125,6 +125,7 @@ class Insta360Trailer {
     this.isRawGyro = false,
     this.meanAccelerometer,
     this.imuSampleCount = 0,
+    this.gyroSamples,
     this.groupIdentity,
     this.groupIndex,
     this.fileLayout,
@@ -174,6 +175,13 @@ class Insta360Trailer {
 
   /// Number of accelerometer samples in [meanAccelerometer]
   final int imuSampleCount;
+
+  /// The gyroscope samples of the IMU record, flattened as `[t, gx, gy, gz, ...]`:
+  /// [t] in milliseconds from the first sample, the rates in radians per second in the frame of the IMU.
+  ///
+  /// Kept for stabilization: integration of these rates gives the pose of the camera at any time of the
+  /// recording, which is what undoes the shake. Read from the same record the accelerometer mean comes from.
+  final List<double>? gyroSamples;
 
   /// The recording a file belongs to (field 26.3): the two files of a split pair carry the same
   final String? groupIdentity;
@@ -284,6 +292,7 @@ Future<Insta360Trailer?> readInsta360Trailer(
 
   List<double>? meanAccelerometer;
   var sampleCount = 0;
+  List<double>? gyroSamples;
   if (imuRecord != null) {
     final sampleLength = metadata.isRawGyro ? _rawImuSampleLength : _imuSampleLength;
     final count = math.min(imuRecord.length, math.max(0, maxImuLength)) ~/ sampleLength;
@@ -294,11 +303,13 @@ Future<Insta360Trailer?> readInsta360Trailer(
           ? _checkedPayload(await bytes.at(imuRecord.start, imuRecord.length + _footerLength), imuRecord, _imuRecord)
           : await bytes.at(imuRecord.start, count * sampleLength);
     }
-    if (samples != null) {
+        if (samples != null) {
       meanAccelerometer = metadata.isRawGyro
           ? _meanRawAccelerometer(samples, count, metadata.accelerometerRange)
           : _meanAccelerometer(samples, count);
       sampleCount = meanAccelerometer == null ? 0 : count;
+      // 防抖要的是全部陀螺仪样本，不只均值
+      gyroSamples = _gyroSamplesOf(samples, count, metadata.isRawGyro, metadata.gyroscopeRange);
     }
   }
 
@@ -317,6 +328,7 @@ Future<Insta360Trailer?> readInsta360Trailer(
     isRawGyro: metadata.isRawGyro,
     meanAccelerometer: meanAccelerometer,
     imuSampleCount: sampleCount,
+    gyroSamples: gyroSamples,
     groupIdentity: metadata.groupIdentity,
     groupIndex: metadata.groupIndex,
     fileLayout: metadata.fileLayout,
@@ -690,8 +702,47 @@ List<double> _meanRawAccelerometer(Uint8List samples, int count, double? range) 
 }
 
 // Mean of the accelerometer of [count] samples of doubles, leaving out the ones that are not finite
-List<double>? _meanAccelerometer(Uint8List samples, int count) {
+/// 陀螺仪样本，扁平存放 `[t, gx, gy, gz, ...]`。
+///
+/// - `t`：相对第一个样本的毫秒数（视频 PTS 也是从文件开头算，可直接对齐）
+/// - `gx/gy/gz`：角速度，**弧度每秒**，IMU 自身坐标系
+///
+/// 普通样本（56 字节）：`i64 毫秒` + 3×`f64` 加速度 + 3×`f64` 陀螺仪。
+/// raw 样本（20 字节）：`u64 微秒` + 3×`u16` 加速度 + 3×`u16` 陀螺仪，
+/// 16 位以 32768 为零点的偏移二进制，量程取 field 65（度每秒），这里换算成弧度。
+List<double>? _gyroSamplesOf(Uint8List samples, int count, bool raw, double? gyroRange) {
+  if (count < 2) return null;
   final data = ByteData.sublistView(samples);
+  final step = raw ? _rawImuSampleLength : _imuSampleLength;
+  final scale = raw ? ((gyroRange ?? 1) / _rawImuZero) * (math.pi / 180.0) : 1.0;
+  final firstMicros = raw ? data.getUint64(0, Endian.little) : data.getInt64(0, Endian.little) * 1000;
+  final out = <double>[];
+  for (var i = 0; i < count; i++) {
+    final o = i * step;
+    final micros = raw ? data.getUint64(o, Endian.little) : data.getInt64(o, Endian.little) * 1000;
+    double gx;
+    double gy;
+    double gz;
+    if (raw) {
+      gx = (data.getUint16(o + 14, Endian.little) - _rawImuZero) * scale;
+      gy = (data.getUint16(o + 16, Endian.little) - _rawImuZero) * scale;
+      gz = (data.getUint16(o + 18, Endian.little) - _rawImuZero) * scale;
+    } else {
+      gx = data.getFloat64(o + 32, Endian.little);
+      gy = data.getFloat64(o + 40, Endian.little);
+      gz = data.getFloat64(o + 48, Endian.little);
+    }
+    if (!gx.isFinite || !gy.isFinite || !gz.isFinite) continue;
+    out
+      ..add((micros - firstMicros) / 1000.0)
+      ..add(gx)
+      ..add(gy)
+      ..add(gz);
+  }
+  return out.isEmpty ? null : out;
+}
+
+List<double>? _meanAccelerometer(Uint8List samples, int count) {  final data = ByteData.sublistView(samples);
   var x = 0.0;
   var y = 0.0;
   var z = 0.0;
